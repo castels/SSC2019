@@ -1,0 +1,824 @@
+---
+title: "SSC Presentation"
+author: "Sophie Castel"
+date: "5/14/2019"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r libraries, cache = TRUE}
+library(multitaper)
+library(tsinterp)
+library(imputeTS)
+library(zoo)
+library(forecast)
+library(MASS)
+library(ggplot2)
+library(dplyr)
+library(snow)
+library(parallel)
+library(RColorBrewer)
+
+# setting a seed for reproducibility
+set.seed(997)
+```
+
+
+I will be simulating 1. Missing Completely at Random and also 2. MCAR (gaps) to see how the interpolators perform in light of different types of missingness patterns. Set gap_width to be 1 if you want true MCAR.
+```{r gaps, cache = TRUE}
+# Function to create MCAR data but with gaps at specified widths
+# x = time series
+# p = percentage of observations to remove
+# cluster_level = degree of clustering
+
+gaps <- function(x, prop_missing, gap_width){
+  
+  n <- length(x)
+  
+  stopifnot(is.numeric(x), 
+            is.numeric(prop_missing), 
+            is.numeric(gap_width),
+            gap_width %% 1 == 0,
+            length(x) > 2, 
+            prop_missing >= 0 & prop_missing <= (n-2)/n,
+            gap_width >=0,
+            prop_missing*gap_width < length(x)-2) 
+
+  poss_values <- 2:(n-1)
+  
+  if ((prop_missing * n / gap_width) %% 1 != 0) {
+    warning(paste("Rounded to the nearest integer multiple; removed ", round(prop_missing*n/gap_width,0)*gap_width, " observations", sep =""))
+  }
+  
+  if((prop_missing * n / gap_width) %% 1 <= 0.5 & (prop_missing * n / gap_width) %% 1 != 0) {
+    end_while <- floor(prop_missing * n) - gap_width
+  } else {
+    end_while <- floor(prop_missing * n)
+  }
+  num_missing <- 0
+  while(num_missing < end_while) {
+    hi <- sample(1:(length(poss_values)-gap_width + 1), 1)
+    poss_values <- poss_values[-(hi:(hi + gap_width -1))]
+    num_missing <- num_missing + gap_width
+  }
+  
+  x.gaps <- x
+  if (length(poss_values) == 0) {
+    x.gaps[2:(n-1)] <- NA
+  } else {
+    x.gaps[-poss_values] <- NA
+  }
+  x.gaps[1] <- x[1]
+  x.gaps[n] <- x[n]
+  
+  return(x.gaps)
+}
+```
+
+Here we define and store a number of performance criteria in a list (as detailed in the Lepot et al. review article) for the comparison of the original ($x$) v.s. interpolated series ($X$).
+```{r criteria, cache = TRUE}
+# Function to define and store performance criteria
+
+eval_performance <- function(x, X) {
+  # x = original , X = interpolated 
+  stopifnot(is.numeric(x), is.numeric(X), length(x) == length(X))
+  
+  n <- length(x)
+  return <- list()
+  
+  # Coefficent of Correlation, r
+  numerator <- sum((X - mean(X))*(x - mean(x)))
+  denominator <- sqrt(sum((X - mean(X))^2)) * sqrt(sum((x - mean(x))^2))
+  return$pearson_r <- numerator / denominator
+  
+  # r^2
+  return$r_squared <- return$pearson_r^2  
+  
+  # Absolute Differences
+  return$abs_differences <- sum(abs(X - x))
+  
+  # Mean Bias Error 
+  return$MBE <- sum(X - x) / n
+  
+  # Mean Error 
+  return$ME <- sum(x - X) / n
+  
+  # Mean Absolute Error 
+  return$MAE <- abs(sum(x - X)) / length(x)
+  
+  # Mean Relative Error 
+  if (length(which(x == 0)) == 0) {
+    return$MRE <- sum((x - X) / x)  
+  } else {
+    return$MRE <- NA
+  }
+  
+  # Mean Absolute Relative Error ##### Lepot
+  if (length(which(x == 0)) == 0) {
+    return$MARE <- 1/length(x)*sum(abs((x - X) / x))
+  } else {
+    return$MARE <- NA 
+  }
+  
+  # Mean Absolute Percentage Error 
+  return$MAPE <- 100 * return$MARE
+  
+  # Sum of Squared Errors
+  return$SSE <- sum((X - x)^2)
+  
+  # Mean Square Error 
+  return$MSE <- 1 / n * return$SSE
+  
+  # Root Mean Squares, or Root Mean Square Errors of Prediction 
+  if (length(which(x == 0)) == 0) {
+    return$RMS <- sqrt(1 / n * sum(((X - x)/x)^2))
+  } else {
+    return$RMS <- NA 
+  }
+  
+  # Mean Squares Error (different from MSE, referred to as NMSE)
+  return$NMSE <- sum((x - X)^2) / sum((x - mean(x))^2)
+  
+  # Reduction of Error, also known as Nash-Sutcliffe coefficient 
+  return$RE <- 1 - return$NMSE
+  
+  # Root Mean Square Error, also known as Root Mean Square Deviations
+  return$RMSE <- sqrt(return$MSE)
+  
+  # Normalized Root Mean Square Deviations 
+  return$NRMSD <- 100 * (return$RMSE / (max(x) - min(x)))
+  
+  # Root Mean Square Standardized Error 
+  if (sd(x) != 0) {
+    return$RMSS <- sqrt(1 / n * sum(( (X-x)/sd(x) )^2))  
+  } else {
+    return$RMSS <- NA 
+  }
+  
+  return(return)
+}
+```
+
+Here we call some functions used for the interpolation of stationary time series.
+```{r algorithms, cache = TRUE}
+nearestNeighbor <- function(x) {
+  stopifnot(is.ts(x)) 
+  
+  findNearestNeighbors <- function(x, i) {
+    leftValid <- FALSE
+    rightValid <- FALSE 
+    numItLeft <- 1
+    numItRight <- 1
+    while (!leftValid) {
+      leftNeighbor <- x[i - numItLeft]
+      if (!is.na(leftNeighbor)) {
+        leftValid <- TRUE
+        leftNeighbor <- i - numItLeft
+      }
+      numItLeft <- numItLeft + 1
+    }
+    while (!rightValid) {
+      rightNeighbor <- x[i + numItRight]
+      if (!is.na(rightNeighbor)) {
+        rightValid <- TRUE
+        rightNeighbor <- i + numItRight
+      }
+      numItRight <- numItRight + 1
+    }
+    return(c(leftNeighbor, rightNeighbor))
+  }
+  
+  for (i in 1:length(x)) {
+    if (is.na(x[i])) {
+      nearestNeighborsIndices <- findNearestNeighbors(x, i)
+      a <- nearestNeighborsIndices[1]
+      b <- nearestNeighborsIndices[2]
+      if (i < ((a + b) / 2)) {
+        x[i] <- x[a]
+      } else {
+        x[i] <- x[b]
+      }
+    }
+  }
+  return(x)
+}
+
+algorithm_names <- c("Nearest Neighbor",
+                     "Linear Interpolation", 
+                     "Natural Cubic Spline",
+                     "FMM Cubic Spline", 
+                     "Hermite Cubic Spline",
+                     "Stineman Interpolation",
+                     "Kalman - ARIMA",
+                     "Kalman - StructTS",
+                     "Last Observation Carried Forward",
+                     "Next Observation Carried Backward", 
+                     "Simple Moving Average", 
+                     "Linear Weighted Moving Average",
+                     "Exponential Weighted Moving Average",
+                     "Replace with Mean",
+                     "Replace with Median", 
+                     "Replace with Mode",
+                     "Replace with Random",
+                     "Hybrid Wiener Interpolator")
+algorithm_calls <- c("nearestNeighbor(", 
+                     "na.approx(", 
+                     "na.spline(method = 'natural', object = ",
+                     "na.spline(method = 'fmm', object = ", 
+                     "na.spline(method = 'monoH.FC', object = ", 
+                     "na_interpolation(option = 'stine', x = ", 
+                     "na_kalman(model = 'auto.arima', x = ", 
+                     "na_kalman(model = 'StructTS', x = ",
+                     "imputeTS::na.locf(option = 'locf', x = ", 
+                     "imputeTS::na.locf(option = 'nocb', x = ", 
+                     "na_ma(weighting = 'simple', x = ",
+                     "na_ma(weighting = 'linear', x = ", 
+                     "na_ma(weighting = 'exponential', x = ",
+                     "na_mean(option = 'mean', x = ", 
+                     "na_mean(option = 'median', x = ",
+                     "na_mean(option = 'mode', x = ", 
+                     "na_random(",
+                     "interpolate(gap = which(is.na(x) == TRUE), progress = FALSE, z = ")
+
+algorithms <- data.frame(algorithm_names, algorithm_calls)
+```
+
+Data import
+```{r data, cache = TRUE}
+# Local (Calgary) daily irradiance 
+solar <- read.table(file = "~/Research/SSC/data/solar.txt", header = TRUE)
+# Local (Calgary) air pollution (ozone) readings
+load("~/Research/SSC/data/Calgary.rda")
+# Seismic activity Black Forest Observatory
+seismic <- read.csv(file = "~/Research/SSC/data/seismic.csv", header = TRUE)
+
+A <- solar$ALLSKY_SFC_LW_DWN
+B <- Calgary$nO3.24hm.lag0
+# replace missig observations with the mean
+B[which(is.na(B))] <- mean(na.omit(B))
+C <- seismic$value
+
+sum(is.na(A)) == 0
+sum(is.na(B)) == 0
+sum(is.na(C)) == 0
+
+### Use data sets of length 1000 (truncate to be most recent 1000 points)
+OriginalData <- list(A[(length(A)-999):length(A)],
+                     B[(length(B)-999):length(B)],
+                     C[(length(C)-999):length(C)])
+```
+
+From this we get a list object called OriginalData, with dimension $d$:
+$d$ = 1, ..., D = dataset$_d$
+
+Here I build a function to simulate gappy data for a single dataset and store in a list.
+```{r simulateGaps, cache = TRUE}
+
+### Function to simulate the gappy data for a single dataset and store in a list
+### data = vector of time series
+### prop_vec = vector of proportion missings
+### gap_vec = vector of gaps to simulate
+### n = number of samples for each gap width and proportion missing specification
+
+simulateGaps <- function(data, prop_vec, gap_vec, n){
+  
+  stopifnot(is.vector(data),
+            is.numeric(data),
+            is.vector(prop_vec), 
+            is.numeric(prop_vec),
+            is.vector(gap_vec),
+            is.numeric(gap_vec),
+            is.null(prop_vec) == FALSE,
+            is.null(gap_vec) == FALSE,
+            is.null(data) == FALSE,
+            n %% 1 == 0,
+            n > 0)
+
+  gapList <- list()
+  propList <- list()
+  
+for(i in 1:length(prop_vec)){  
+  for (j in 1:length(gap_vec)){
+    for(k in 1:n){
+      samples[[k]] <- as.ts(gaps(data, prop_missing = prop_vec[i], gap_width = gap_vec[j]))
+    }
+    gapList[[j]] <- samples 
+  }
+  propList[[i]] <- gapList
+}
+  
+  return(propList)
+}
+
+```
+
+Here we use the function on three datasets with prop_vec, gap_vec and n specifications.
+```{r GappyData, cache = TRUE}
+prop_vec = c(0.05,0.10,0.15,0.20)
+gap_vec = c(1,10,50)
+n = 100
+
+A_gaps <- simulateGaps(data = OriginalData[[1]], prop_vec = prop_vec, gap_vec = gap_vec, n = n)
+B_gaps <- simulateGaps(data = OriginalData[[2]], prop_vec = prop_vec, gap_vec = gap_vec, n = n)
+C_gaps <- simulateGaps(data = OriginalData[[3]], prop_vec = prop_vec, gap_vec = gap_vec, n = n)
+
+GappyData <- list(A_gaps, B_gaps, C_gaps) # dimension (d, i, j, k) 
+```
+
+From this we get a multi-level list object called GappyData, with dimension $d,i,j,k$:
+$d = 1,..., D $ = dataset$_d$
+$i$ = 1, ..., length(prop_vec) = proportion of missing values$_i$
+$j$ = 1, ..., length(gap_vec) = gap width$_j$
+$k$ = 1, ..., n = sample ID under each $d,i,j$ specification
+
+Here we perform interpolation on the gappy series using user-specified methods.
+```{r Interpolate, cache = TRUE}
+### Function to perform interpolation on the gappy series using user-specified methods and datasets
+### gappyTS = Gappy time series object
+### methods = vector of IDs for selected interpolation methods (1:18 for all)
+
+Interpolate <- function(data, methods){ 
+  
+  #Creating a list object to store interpolated series
+   int_series <- lapply(int_series <- vector(mode = 'list',length(methods)),function(x)
+    lapply(int_series <- vector(mode = 'list', length(data)),function(x) 
+    lapply(int_series <- vector(mode = 'list',length(data[[1]])),function(x) 
+    x<-vector(mode='list',length(data[[1]][[1]])))))
+  
+   # Interpolate using each method specified
+  for(m in 1:length(methods)){ # write as an parapply() 
+    
+    if(methods[m] == 18){
+        function_call <- paste(algorithm_calls[methods[m]], "data[[i]][[j]][[k]]", ")","[[1]]", sep = "")
+    }
+    else{
+        function_call <- paste(algorithm_calls[methods[m]], "data[[i]][[j]][[k]]", ")", sep = "")
+    }
+    
+    for(i in 1:length(data)){
+      for(j in 1:length(data[[1]])){
+        for(k in 1:length(data[[1]][[1]])){
+          int_series[[m]][[i]][[j]][[k]] <- eval(parse(text = function_call))
+        }
+      }
+    }
+  }
+   
+  return(int_series)
+}
+
+```
+
+Trying to rewrite Interpolate to run in parallel:
+
+```{r parInterpolate, cache = TRUE}
+### Function to perform interpolation on the gappy series in parallel using user-specified methods and datasets
+### gappyTS = Gappy time series object
+### methods = vector of IDs for selected interpolation methods (1:18 for all)
+
+parInterpolate <- function(data, methods){ 
+  
+  #Creating a list object to store interpolated series
+   int_series <- lapply(int_series <- vector(mode = 'list',length(methods)),function(x)
+    lapply(int_series <- vector(mode = 'list', length(data)),function(x) 
+    lapply(int_series <- vector(mode = 'list',length(data[[1]])),function(x) 
+    x<-vector(mode='list',length(data[[1]][[1]])))))
+  
+   ## Would be nice to wrap function in mclapply() instead of for()... 
+   # but the irony is that it will take too much time to learn how to do! :) 
+
+  for(m in 1:length(methods)){ 
+    
+    if(methods[m] == 18){
+        function_call <- paste(algorithm_calls[methods[m]], "x", ")","[[1]]", sep = "")
+    }
+    else{
+        function_call <- paste(algorithm_calls[methods[m]], "x", ")", sep = "")
+    }
+  
+          int_series[[m]] <- mclapply(data, function(x){
+            lapply(x, function(x){
+              lapply(x, function(x){
+                eval(parse(text = function_call))}
+                )}
+              )}, 
+            mc.cores = detectCores())
+  }
+   
+  return(int_series)
+}
+
+```
+
+Here we use the function on each dataset and store in a new list
+```{r IntData, cache = TRUE}
+methods <- c(1:18)
+
+A_int <- parInterpolate(data = GappyData[[1]], methods = methods)
+B_int <- parInterpolate(data = GappyData[[2]], methods = methods)
+C_int <- parInterpolate(data = GappyData[[3]], methods = methods)
+
+IntData <- list(A_int, B_int, C_int)
+```
+
+From this we get a multi-level list object called IntData, with dimension $d,m,i,j,k$:
+$d$ = 1, ..., D = dataset$_d$
+$m$ = 1, ..., M = interpolation method$_m$
+$i$ = 1, ..., length(prop_vec) = proportion of missing values$_i$
+$j$ = 1, ..., length(gap_vec) = gap width$_j$
+$k$ = 1, ..., n = sample ID under each $d,m,i,j,k$ specification
+
+... And now we evaluate the performance criteria:
+```{r performance, cache = TRUE}
+D <- length(IntData)
+M <- length(IntData[[1]])
+P <- length(IntData[[1]][[1]])
+G <- length(IntData[[1]][[1]][[1]])
+N <- length(IntData[[1]][[1]][[1]][[1]])
+
+Performance <- lapply(Performance <- vector(mode = 'list', D),function(x)
+    lapply(Performance <- vector(mode = 'list', M),function(x) 
+    lapply(Performance <- vector(mode = 'list', P),function(x) 
+    lapply(Performance <- vector(mode = 'list', G),function(x) 
+    x<-vector(mode='list', N)))))
+
+# Evaluate the performance criteria for each sample in each (d,m,i,j) specification
+for(d in 1:D){
+  for(m in 1:M){
+    for(i in 1:P){
+      for(j in 1:G){
+        for(k in 1:N) { 
+
+  Performance[[d]][[m]][[i]][[j]][[k]] <- unlist(eval_performance(x = OriginalData[[d]], X = IntData[[d]][[m]][[i]][[j]][[k]]))
+  
+    }
+   }
+  }
+ }
+}
+
+```
+
+We create a performance matrix that gives the mean of each performance criteria.
+
+So, we have a list: 3 x M x 4 x 3 x 100 x 17 (d x p x g x n x M x 17) where M is the number of interpolation methods used.
+
+What are we interested in? The performance of each interpolation method with respect to the proportion missing and gap width. 
+Thus, we want to compute the mean of each of the 17 performance criteria in each g,p,d,m specification across all k simulations in that specification.
+
+So, we should make a dataframe:
+
+```{r Evaluation, cache = TRUE}
+
+D <- length(Performance)
+M <- length(Performance[[1]])
+P <- length(Performance[[1]][[1]])
+G <- length(Performance[[1]][[1]][[1]])
+
+dataset <- 1:D
+
+Evaluation <- lapply(Evaluation <- vector(mode = 'list', D),function(x)
+    lapply(Evaluation <- vector(mode = 'list', P),function(x) 
+    lapply(Evaluation <- vector(mode = 'list', G),function(x) 
+    x<-vector(mode='list',M))))
+
+
+  for(d in 1:D){
+    for(i in 1:P){
+      for(j in 1:G){
+        for(m in 1:M){
+       # compute the mean of the performance criteria in each (d,m,i,j) specification across all k pairs of (x,X) and store results
+          # in a list of data frames
+        Evaluation[[d]][[i]][[j]][[m]] <- data.frame(
+
+          value = rowMeans(sapply(Performance[[d]][[m]][[i]][[j]],unlist)),
+    
+          gap_width = c(rep(gap_vec[j], 17)),
+          prop_missing = c(rep(prop_vec[i],17)),
+          dataset = c(rep(dataset[d],17)), 
+          method = rep(algorithm_names[methods[m]],17) 
+        )  
+  
+      }
+    }
+  }
+}
+
+```
+
+Now that we have all of these dataframes, we want to find the best interpolator for each dataset, under each prop_missing,gap_width combination according to each of the 17 criteria.
+
+First we need to define "best" with respect to each criterion:
+```{r best, cache = TRUE}
+criteria <- names(Performance[[1]][[1]][[1]][[1]][[1]])
+# "optimal" is defined differently (either max or min) depending on the criterion
+best <- data.frame(criterion = criteria, maximize = c(1,1,rep(0,11),1,rep(0,3))) # 1 = yes, 0 = no
+```
+
+Now obtain the optimal method under (dataset,prop_missing,gap_width) specification according to the 17 criteria: 
+
+```{r Best, cache = TRUE}
+D <- length(Evaluation)
+P <- length(Evaluation[[1]])
+G <- length(Evaluation[[1]][[1]])
+
+dataset <- 1:D
+
+# create a list to store results
+Best <- lapply(Best <- vector(mode = 'list', D),function(x)
+    lapply(Best <- vector(mode = 'list', P),function(x) 
+    x<-vector(mode='list',G)))
+
+  for(d in 1:D){
+    for(i in 1:P){
+      for(j in 1:G){
+        
+            Value = numeric()
+            Method = numeric()
+            
+      # find the optimal value according to each of the 17 criteria
+            
+          for(c in 1:length(criteria)){
+    
+            do <- do.call("rbind",Evaluation[[d]][[i]][[j]])
+            subset <- do[grepl(criteria[c],rownames(do)),]
+  
+            if(best$maximize[c] == "1"){
+              Value[c] = subset$value[which.max(subset$value)]
+              Method[c] = as.character(subset$method)[which.max(subset$value)]
+            }
+            else{
+              Value[c] = subset$value[which.min(subset$value)]
+              Method[c] = as.character(subset$method)[which.min(subset$value)]
+            }
+          } 
+         
+       # store results in a list of data frames    
+        Best[[d]][[i]][[j]] <- data.frame(
+          
+          value = Value,
+          best = Method,
+          gap_width = c(rep(gap_vec[j], 17)),
+          prop_missing = c(rep(prop_vec[i],17)),
+          dataset = c(rep(dataset[d],17)), row.names = criteria
+        )  
+  
+      }
+    }
+  }
+
+```
+
+
+And the final summary. We show the most frequently occurring "best" method across the 17 criteria for each (dataset,prop_missing,gap_width) (d,i,j) specification:
+
+```{r Summary, cache = TRUE}
+D <- length(Best)
+P <- length(Best[[1]])
+G <- length(Best[[1]][[1]])
+
+dataset <- 1:D
+
+# create a list to store results
+Summary <- lapply(Summary <- vector(mode = 'list', D),function(x)
+    lapply(Summary <- vector(mode = 'list', P),function(x) 
+    x<-vector(mode='list',G)))
+
+for(d in 1:D){
+  for(i in 1:P){
+    for(j in 1:G){
+      
+      # find the most frequently occuring method
+      optimal_m <- tail(names(sort(table(Best[[d]][[i]][[j]]$best))), 1)
+      
+      Summary[[d]][[i]][[j]] <- data.frame(
+       
+        dataset = dataset[d], 
+        prop_missing = prop_vec[i],
+        gap_width = gap_vec[j],
+        optimal = optimal_m
+      )
+    }
+    
+    # collapse list by gap_width into data.frames 
+    Summary[[d]][[i]] <- do.call("rbind", Summary[[d]][[i]])
+  }
+}
+```
+
+We should create some plots to visually display the results of the simulations. 
+
+```{r y_list, cache = TRUE}
+# Create a list of dataframes to store the average values of the performance criteria for each method in each (dataset,prop_missing,gap_width) (d,i,j)
+
+D <- length(Evaluation)
+P <- length(Evaluation[[1]])
+G <- length(Evaluation[[1]][[1]])
+M <- length(Evaluation[[1]][[1]][[1]])
+
+y <- data.frame(matrix(ncol = M, nrow = nrow(Evaluation[[1]][[1]][[1]][[1]])))
+
+y_list <- lapply(y_list <- vector(mode = 'list', D),function(x)
+    lapply(y_list <- vector(mode = 'list', P),function(x) 
+    x<-vector(mode='list',G)))
+
+for(d in 1:D){
+  for(i in 1:P){
+    for(j in 1:G){
+      for(m in 1:M){
+        
+        y[,m] <- Evaluation[[d]][[i]][[j]][[m]]$value
+        colnames(y)[m] <- algorithm_names[methods[m]]
+        rownames(y) <- criteria
+      }
+      
+      y_list[[d]][[i]][[j]] <- y
+      
+      
+    }
+  }
+}
+
+```
+
+```{r plots, cache = TRUE}
+### Function to generate plots that show the performance of user-specified methods with respect to a particular cross-section of the results: gap_width, prop_missing, dataset.
+
+metrics = c(1,11)
+methods = c(4,7,18)
+
+D <- length(Evaluation)
+P <- length(Evaluation[[1]])
+
+bigList <- lapply(bigList <- vector(mode = 'list', P),function(x)
+    lapply(bigList <- vector(mode = 'list', D),function(x) 
+    lapply(bigList <- vector(mode = 'list', length(methods)),function(x) 
+    x<-vector(mode='list',length(metrics)))))
+
+x <- numeric(length = length(gap_vec))
+y <- numeric(length = length(gap_vec))
+
+for(i in 1:P){
+      for(d in 1:D){
+        for(m in 1:length(methods)){
+          for(M in 1:length(metrics)){
+            for(j in 1:length(gap_vec)){
+              
+            x[j] <- Evaluation[[d]][[i]][[j]][[methods[m]]][1,'gap_width']
+            y[j] <- Evaluation[[d]][[i]][[j]][[methods[m]]][criteria[metrics[M]],'value']
+            
+            bigList[[i]][[d]][[m]][[M]]$x <- x 
+            bigList[[i]][[d]][[m]][[M]]$y <- y 
+            
+        }
+      }
+    }
+  }
+}
+
+#### USE THIS TOMORROW 
+palette <- brewer.pal(9,'Set1')
+
+palette <- c("red","blue","green")
+pchs <-c(2,10,12)
+
+par(mfrow = c(P,D))
+## PEARSON R
+M = 1
+plot <- for(i in 1:P){
+          for(d in 1:D){
+            plot(x = bigList[[i]][[d]][[1]][[M]]$x, 
+                y = bigList[[i]][[d]][[1]][[M]]$y,
+                ylim = c(0.5,1), 
+                ylab = criteria[metrics[M]], 
+                xlab = "gap_width",
+                main = paste("prop missing = ",prop_vec[i],",","dataset = ",dataset[d],sep = ""),
+                col = palette[1] # this is the problem
+                )
+    
+          for(m in 1:length(methods)){
+            points(bigList[[i]][[d]][[m]][[M]]$x, bigList[[i]][[d]][[m]][[M]]$y, col = palette[m], pch = pchs[m])
+            lines(bigList[[i]][[d]][[m]][[M]]$x, bigList[[i]][[d]][[m]][[M]]$y, col = palette[m], pch = pchs[m])
+          }
+            
+            legend(x = 0, y = 0.8, legend = algorithm_names[methods], col = palette, lty = rep(1,length(methods)), lwd = 2)
+  }
+}
+
+
+## MSE
+M = 2
+plot <- for(i in 1:P){
+          for(d in 1:D){
+            plot(x = bigList[[i]][[d]][[1]][[M]]$x, 
+                y = bigList[[i]][[d]][[1]][[M]]$y,
+                ylim = c(0,10000), 
+                ylab = criteria[metrics[M]], 
+                xlab = "gap_width",
+                main = paste("prop missing = ",prop_vec[i],",","dataset = ",dataset[d],sep = ""),
+                col = palette[1] # this is the problem
+                )
+    
+          for(m in 1:length(methods)){
+            points(bigList[[i]][[d]][[m]][[M]]$x, bigList[[i]][[d]][[m]][[M]]$y, col = palette[m], pch = pchs[m])
+            lines(bigList[[i]][[d]][[m]][[M]]$x, bigList[[i]][[d]][[m]][[M]]$y, col = palette[m], pch = pchs[m])
+          }
+            
+            legend(x = 0, y = 0.8, legend = algorithm_names[methods], col = palette, lty = rep(1,length(methods)), lwd = 2)
+  }
+}
+
+getPlots <- function(dataset, prop_missing, gap_width, criterion){
+  
+  data <- data.frame(t(y_list[[dataset]][[prop_missing]][[gap_width]]))
+  y_data <- data[,criterion]
+  HW_value <- y_data[18]
+  
+  a_b <- numeric(length = length(y_data))
+delta <- numeric(length = length(y_data))
+optim <- numeric(length = 1)
+
+if(best[criterion,2] == 1){
+  for (l in 1:length(y_data)){
+  
+  if(y_data[l] > HW_value){
+    a_b[l] <- "better"
+  }
+  
+  else if(y_data[l] == HW_value){
+    a_b[l] <- "equal"
+  }
+  else{
+    a_b[l] <- "worse"
+  }
+  
+  delta[l] <- y_data[l] - HW_value
+  optim <- "maximize"
+
+}
+}
+else{
+  for (l in 1:length(y_data)){
+  
+  if(y_data[l] > HW_value){
+    a_b[l] <- "worse"
+  }
+  
+  else if(y_data[l] == HW_value){
+    a_b[l] <- "equal"
+  }
+  else{
+    a_b[l] <- "better"
+  }
+  
+  delta[l] <- y_data[l] - HW_value
+  optim <- "minimize"
+}
+}
+
+if(dataset == "1"){
+  ggplot(data, aes(x = rownames(data), y = y_data)) + 
+  geom_bar(stat = 'identity', aes(fill = a_b), width = 0.5) + 
+             scale_fill_manual(name = "Performance",
+                               values = c("better" = "#00ba38", "equal" = "lightskyblue", "worse" = "#f8766d")) + 
+            labs (subtitle = paste("proportion missing =", prop_vec[prop_missing],", ","gap width =", gap_vec[gap_width],sep=""),
+                   title = "Calgary  Irradiance Data",
+                   x = "Interpolation Method",
+                   y = paste(criteria[criterion],"(best = ",optim,")",sep="")) + 
+             coord_flip() + ylim(0,1)
+}
+
+else if(dataset == "2"){
+  ggplot(data, aes(x = rownames(data), y = y_data)) + 
+  geom_bar(stat = 'identity', aes(fill = a_b), width = 0.5) + 
+             scale_fill_manual(name = "Performance",
+                               values = c("better" = "#00ba38", "equal" = "lightskyblue", "worse" = "#f8766d")) + 
+            labs (subtitle = paste("proportion missing =", prop_vec[prop_missing],", ","gap width =", gap_vec[gap_width],sep=""),
+                   title = "Calgary Ozone Data",
+                   x = "Interpolation Method",
+                   y = paste(criteria[criterion],"(best = ",optim,")",sep="")) + 
+             coord_flip() + ylim(0,1)
+}
+
+else{
+  ggplot(data, aes(x = rownames(data), y = y_data)) +
+  geom_bar(stat = 'identity', aes(fill = a_b), width = 0.5) + 
+             scale_fill_manual(name = "Performance",
+                               values = c("better" = "#00ba38", "equal" = "lightskyblue", "worse" = "#f8766d")) + 
+            labs (subtitle = paste("proportion missing =", prop_vec[prop_missing],", ","gap width =", gap_vec[gap_width],sep=""),
+                   title = "Calgary Seismic Data",
+                   x = "Interpolation Method",
+                   y = paste(criteria[criterion],"(best = ",optim,")",sep="")) + 
+             coord_flip() + ylim(0,1)
+}
+  
+}
+
+getPlots(dataset = 1, prop_missing = 1, gap_width = 1, criterion = 8)
+
+
+```
